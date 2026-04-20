@@ -160,7 +160,6 @@ body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);min
 .modal-title{font-size:17px;font-weight:600;margin-bottom:1.25rem;}
 .modal-actions{display:flex;gap:8px;margin-top:1.25rem;justify-content:flex-end;}
 
-/* LOADING OVERLAY */
 .loading-overlay{display:none;position:fixed;inset:0;background:rgba(10,14,19,.85);z-index:999;align-items:center;justify-content:center;flex-direction:column;gap:1rem;}
 .loading-overlay.show{display:flex;}
 .spinner{width:36px;height:36px;border:3px solid var(--border2);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;}
@@ -425,6 +424,8 @@ body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);min
     </div>
   </div>
 </div>
+
+<div class="modal-overlay" id="modal-reset">
   <div class="modal">
     <div class="modal-title">Alle data verwijderen?</div>
     <p style="color:var(--text2);font-size:14px;line-height:1.6">Dit verwijdert alle spelers en wedstrijden uit de database. Niet terug te draaien.</p>
@@ -464,10 +465,6 @@ function lvCls(l){return'badge lv-'+l.toLowerCase();}
 function avStyle(l){return{Beginner:'background:#1a2330;color:#7a8fa6',Bronze:'background:#2a1e0f;color:#cd8b4a',Silver:'background:#1e2530;color:#a8b8c8',Gold:'background:#2a2008;color:#f5a623',Diamond:'background:#0f1e2a;color:#7dd3fc'}[l]||'background:#1a2330;color:#7a8fa6';}
 
 // ── KNLTB DUBBELSPEL FORMULE ──────────────────────────────
-// Stap 1: gecombineerde rating koppel = θ*R1 + (1-θ)*R2  (θ=0.5 → gewoon gemiddelde)
-// Stap 2: winstverwachting = 1 / (1 + e^(-q*(R12_eigen - R12_opp)))  q=2.012
-// Stap 3: nieuwe rating = R_oud + K*(prob - result)  K=0.275
-// Bereik: 1.0 – 9.0  (9=beginner, 1=prof)
 const K_KNLTB = 0.275;
 const Q_DUBBEL = 2.012;
 const THETA = 0.5;
@@ -476,13 +473,11 @@ function combinedRating(r1, r2){ return THETA*r1 + (1-THETA)*r2; }
 function winProb(r12own, r12opp){ return 1 / (1 + Math.exp(-Q_DUBBEL * (r12own - r12opp))); }
 function newRating(rOld, prob, result){ return Math.max(1.0, Math.min(9.0, rOld + K_KNLTB * (prob - result))); }
 
-// Bereken nieuwe ratings voor beide koppels na een dubbelwedstrijd
-// Won = true betekent koppel A wint (result=1 voor A, result=0 voor B)
 function knltbDoubles(rA1, rA2, rB1, rB2, teamAWon){
   const r12A = combinedRating(rA1, rA2);
   const r12B = combinedRating(rB1, rB2);
-  const probA = winProb(r12A, r12B); // winstverwachting team A
-  const probB = 1 - probA;           // winstverwachting team B
+  const probA = winProb(r12A, r12B);
+  const probB = 1 - probA;
   const resultA = teamAWon ? 1 : 0;
   const resultB = teamAWon ? 0 : 1;
   return {
@@ -500,6 +495,28 @@ function closeModal(id){document.getElementById(id).classList.remove('open');}
 function showLoading(txt='Laden…'){document.getElementById('loading-text').textContent=txt;document.getElementById('loading').classList.add('show');}
 function hideLoading(){document.getElementById('loading').classList.remove('show');}
 function nextLevel(lv){return{Beginner:'Bronze',Bronze:'Silver',Silver:'Gold',Gold:'Diamond',Diamond:'Diamond (max)'}[lv]||lv;}
+
+// ── DEBUG FUNCTIE ─────────────────────────────────────────
+async function testConnection() {
+    try {
+        console.log('🔍 Testing Supabase connection...');
+        const { data, error } = await sb.from('players').select('count', { count: 'exact', head: true });
+        if (error) {
+            console.error('❌ Supabase error:', error);
+            toast('Database verbinding mislukt: ' + error.message, 'error');
+            document.getElementById('conn-status').textContent='● Offline';
+            document.getElementById('conn-status').style.color='var(--danger)';
+        } else {
+            console.log('✅ Supabase connected successfully!');
+            document.getElementById('conn-status').textContent='● Online';
+            document.getElementById('conn-status').style.color='var(--accent)';
+        }
+    } catch (e) {
+        console.error('❌ Connection test failed:', e);
+        document.getElementById('conn-status').textContent='● Offline';
+        document.getElementById('conn-status').style.color='var(--danger)';
+    }
+}
 
 // ── SUPABASE DATA LAYER ───────────────────────────────────
 async function fetchAllPlayers(){
@@ -530,51 +547,193 @@ async function loadAll(){
       if(pw) adminPw = pw.value;
       if(pm) promos  = parseInt(pm.value)||0;
     }
-    document.getElementById('conn-status').textContent='● Online';
-    document.getElementById('conn-status').style.color='var(--accent)';
+    console.log('✅ Data loaded:', players.length, 'players,', matches.length, 'matches');
     renderRanking();
     renderPlayers();
+    renderHistory();
   } catch(e) {
     toast('Fout bij laden: '+e.message,'error');
-    document.getElementById('conn-status').textContent='● Offline';
-    document.getElementById('conn-status').style.color='var(--danger)';
+    console.error('Load error:', e);
   }
   hideLoading();
 }
 
-async function dbUpsertPlayer(p){
-  // Stuur id alleen mee als het een bestaande Supabase-rij is (getal > 0)
-  const payload = {
-    name: p.name, email: p.email||'',
-    rating: Math.round(p.rating * 100) / 100,
-    matches: p.matches, wins: p.wins
-  };
-  if(p.id) payload.id = p.id;
-  const {data, error} = await sb.from('players').upsert(payload).select().single();
-  if(error) throw error;
-  // Update lokaal id als het nieuw was
-  if(data && !p.id) p.id = data.id;
+async function updatePlayersBatch(playersToUpdate) {
+    if (!playersToUpdate || playersToUpdate.length === 0) return;
+    
+    const formattedPlayers = playersToUpdate.map(p => ({
+        id: p.id,
+        name: p.name,
+        email: p.email || '',
+        rating: Math.round(p.rating * 100) / 100,
+        matches: p.matches,
+        wins: p.wins
+    }));
+    
+    console.log('📤 Updating players:', formattedPlayers.map(p => ({ id: p.id, name: p.name, rating: p.rating })));
+    
+    const { data, error } = await sb
+        .from('players')
+        .upsert(formattedPlayers, { onConflict: 'id' })
+        .select();
+    
+    if (error) {
+        console.error('❌ Player update failed:', error);
+        throw error;
+    }
+    
+    console.log('✅ Players updated successfully:', data?.length || 0, 'players');
+    return data;
 }
 
-async function dbUpdatePlayers(list){
-  for(const p of list) await dbUpsertPlayer(p);
+// ── SUBMIT MATCH (VERBETERD) ─────────────────────────────────
+async function submitMatch() {
+    console.log('🎾 submitMatch() started');
+    
+    // 1. Valideer invoer
+    if (!sel.a1 || !sel.a2 || !sel.b1 || !sel.b2) {
+        toast('Kies 4 spelers.', 'error');
+        console.log('❌ Missing players:', { a1: sel.a1, a2: sel.a2, b1: sel.b1, b2: sel.b2 });
+        return;
+    }
+    
+    const ids = [sel.a1, sel.a2, sel.b1, sel.b2];
+    if (new Set(ids).size < 4) {
+        toast('Kies 4 verschillende spelers.', 'error');
+        return;
+    }
+    
+    console.log('👥 Player IDs:', ids);
+    
+    // 2. Lees scores
+    const sets = [[sv('s1a'), sv('s1b')], [sv('s2a'), sv('s2b')], [sv('s3a'), sv('s3b')]];
+    const played = sets.filter(([a, b]) => a !== null && b !== null);
+    if (played.length < 2) {
+        toast('Voer minimaal 2 sets in.', 'error');
+        return;
+    }
+    
+    const comp = document.getElementById('m-comp').checked;
+    const wA = played.filter(([a, b]) => a > b).length;
+    const wB = played.filter(([a, b]) => b > a).length;
+    const aWon = wA > wB;
+    
+    console.log('📊 Match info:', { sets: played, competitive: comp, teamAWon: aWon });
+    
+    showLoading('Opslaan in database...');
+    
+    try {
+        // 3. Haal FRISSE spelers op uit database
+        console.log('🔄 Fetching fresh player data from database...');
+        const { data: freshPlayers, error: fetchError } = await sb
+            .from('players')
+            .select('*')
+            .in('id', ids);
+        
+        if (fetchError) throw new Error(`Fetch failed: ${fetchError.message}`);
+        if (!freshPlayers || freshPlayers.length !== 4) {
+            throw new Error(`Found ${freshPlayers?.length || 0} players, expected 4`);
+        }
+        
+        console.log('✅ Fresh players loaded:', freshPlayers.map(p => ({ id: p.id, name: p.name, rating: p.rating })));
+        
+        const pA = freshPlayers.filter(p => ids.slice(0, 2).includes(p.id));
+        const pB = freshPlayers.filter(p => ids.slice(2, 4).includes(p.id));
+        
+        // 4. Bereken nieuwe ratings
+        let promoNames = [];
+        let updatedPromos = promos;
+        
+        if (comp) {
+            const { newA1, newA2, newB1, newB2 } = knltbDoubles(
+                pA[0].rating, pA[1].rating, 
+                pB[0].rating, pB[1].rating, 
+                aWon
+            );
+            
+            console.log('📈 Calculated new ratings:', { newA1, newA2, newB1, newB2 });
+            
+            [[pA[0], newA1], [pA[1], newA2], [pB[0], newB1], [pB[1], newB2]].forEach(([p, nr]) => {
+                const oldLv = level(p.rating);
+                p.rating = nr;
+                p.matches++;
+                if ((p === pA[0] || p === pA[1]) ? aWon : !aWon) p.wins++;
+                if (lvOrder(level(p.rating)) < lvOrder(oldLv)) {
+                    promoNames.push(p.name);
+                    updatedPromos++;
+                }
+            });
+        } else {
+            [...pA, ...pB].forEach((p, i) => {
+                p.matches++;
+                if ((i < 2 && aWon) || (i >= 2 && !aWon)) p.wins++;
+            });
+        }
+        
+        // 5. Sla de match op
+        const matchData = {
+            date: new Date().toISOString(),
+            team_a: ids.slice(0, 2),
+            team_b: ids.slice(2, 4),
+            score_a: played.map(s => s[0]),
+            score_b: played.map(s => s[1]),
+            competitive: comp,
+            kotc: false
+        };
+        
+        console.log('💾 Saving match:', matchData);
+        
+        const { error: matchError } = await sb
+            .from('matches')
+            .insert(matchData);
+        
+        if (matchError) throw new Error(`Match insert failed: ${matchError.message}`);
+        console.log('✅ Match saved successfully');
+        
+        // 6. Update spelers in database (BATCH)
+        const playersToUpdate = [...pA, ...pB];
+        await updatePlayersBatch(playersToUpdate);
+        
+        // 7. Update promos setting
+        if (comp && promoNames.length) {
+            console.log('🏆 Promotions detected:', promoNames);
+            await sb.from('settings').upsert({ 
+                key: 'promos', 
+                value: String(updatedPromos) 
+            });
+            promos = updatedPromos;
+        }
+        
+        // 8. HERLAAD alle data uit database
+        console.log('🔄 Reloading all data from database...');
+        await loadAll();
+        
+        // 9. UI feedback
+        if (promoNames.length) {
+            document.getElementById('promo-text').textContent = 'Promotie! ' + promoNames.join(' & ') + ' gaat omhoog!';
+            document.getElementById('promo-banner').classList.add('show');
+            toast('Promotie! Ratings bijgewerkt.', 'promo');
+        } else {
+            toast('Wedstrijd opgeslagen!', 'success');
+        }
+        
+        // 10. Reset formulier
+        initWedstrijd();
+        
+    } catch (e) {
+        console.error('❌ CRITICAL ERROR in submitMatch:', e);
+        toast('Fout: ' + e.message, 'error');
+    }
+    
+    hideLoading();
 }
 
-async function dbInsertMatch(m){
-  const {error} = await sb.from('matches').insert({
-    date: m.date, team_a: m.team_a, team_b: m.team_b,
-    score_a: m.score_a, score_b: m.score_b,
-    competitive: m.competitive, kotc: m.kotc,
-    kotc_level: m.kotc_level||null, kotc_duos: m.kotc_duos||null
-  });
-  if(error) throw error;
-}
+function sv(id){const v=document.getElementById(id).value;return v===''?null:parseInt(v);}
 
-async function dbSetSetting(key, value){
-  await sb.from('settings').upsert({key, value: String(value)});
-}
+// ── REST VAN DE FUNCTIES (ongewijzigd) ────────────────────
+// ... (de rest van je functies blijven hetzelfde)
 
-// ── NAV ───────────────────────────────────────────────────
+// ── NAVIGATIE ─────────────────────────────────────────────
 function nav(page,btn){
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(b=>b.classList.remove('active'));
@@ -606,10 +765,10 @@ function renderRanking(){
   tbody.innerHTML=slice.map((p,i)=>{
     const pos=rankCur*PAGE+i+1, lv=level(p.rating), pc=pos===1?'p1':pos===2?'p2':pos===3?'p3':'';
     return`<tr><td class="rank-pos ${pc}">${pos}</td>
-      <td><div class="player-cell"><div class="avatar" style="${avStyle(lv)}">${initials(p.name)}</div>
+       <td><div class="player-cell"><div class="avatar" style="${avStyle(lv)}">${initials(p.name)}</div>
       <div><div class="pname">${p.name}</div>${adminUnlocked?`<div class="pemail">${p.email||'–'}</div>`:''}</div></div></td>
-      <td><span class="${lvCls(lv)}">${lv}</span></td>
-      <td><span class="rating-val">${p.rating.toFixed(2)}</span></td>
+       <td><span class="${lvCls(lv)}">${lv}</span></td>
+       <td><span class="rating-val">${p.rating.toFixed(2)}</span></td>
       <td style="color:var(--text2);font-size:13px">${p.matches}</td>
       <td style="color:var(--text2);font-size:13px">${p.wins}</td></tr>`;
   }).join('');
@@ -673,61 +832,8 @@ function setMode(mode,btn){
   if(mode==='kotc')initKotcForm();
 }
 
-// ── SUBMIT NORMALE WEDSTRIJD ──────────────────────────────
-async function submitMatch(){
-  if(!sel.a1||!sel.a2||!sel.b1||!sel.b2){toast('Kies 4 spelers.','error');return;}
-  const ids=[sel.a1,sel.a2,sel.b1,sel.b2];
-  if(new Set(ids).size<4){toast('Kies 4 verschillende spelers.','error');return;}
-  const sets=[[sv('s1a'),sv('s1b')],[sv('s2a'),sv('s2b')],[sv('s3a'),sv('s3b')]];
-  const played=sets.filter(([a,b])=>a!==null&&b!==null);
-  if(played.length<2){toast('Voer minimaal 2 sets in.','error');return;}
-  const comp=document.getElementById('m-comp').checked;
-  const wA=played.filter(([a,b])=>a>b).length, wB=played.filter(([a,b])=>b>a).length;
-  const aWon=wA>wB;
-  const pA=ids.slice(0,2).map(id=>players.find(p=>p.id===id));
-  const pB=ids.slice(2,4).map(id=>players.find(p=>p.id===id));
-
-  showLoading('Opslaan…');
-  try {
-    let promoNames=[];
-    if(comp){
-      const {newA1,newA2,newB1,newB2} = knltbDoubles(pA[0].rating, pA[1].rating, pB[0].rating, pB[1].rating, aWon);
-      [[pA[0],newA1],[pA[1],newA2],[pB[0],newB1],[pB[1],newB2]].forEach(([p,nr])=>{
-        const oldLv=level(p.rating);
-        p.rating=nr;
-        p.matches++;
-        if(p===pA[0]||p===pA[1]){ if(aWon) p.wins++; }
-        else { if(!aWon) p.wins++; }
-        if(lvOrder(level(p.rating))<lvOrder(oldLv)){promoNames.push(p.name);promos++;}
-      });
-    } else {
-      [...pA,...pB].forEach((p,i)=>{p.matches++;if(i<2?aWon:!aWon)p.wins++;});
-    }
-    await dbUpdatePlayers([...pA,...pB]);
-    await dbInsertMatch({
-      date:new Date().toISOString(), team_a:ids.slice(0,2), team_b:ids.slice(2,4),
-      score_a:played.map(s=>s[0]), score_b:played.map(s=>s[1]),
-      competitive:comp, kotc:false
-    });
-    if(comp&&promoNames.length) await dbSetSetting('promos', promos);
-    // Herlaad alles vanuit de database zodat data klopt na reload
-    await loadAll();
-    renderRanking();
-    if(promoNames.length){
-      document.getElementById('promo-text').textContent='Promotie! '+promoNames.join(' & ')+' gaat omhoog!';
-      document.getElementById('promo-banner').classList.add('show');
-      toast('Promotie! Ratings bijgewerkt.','promo');
-    } else toast('Wedstrijd opgeslagen!','success');
-    initWedstrijd();
-  } catch(e){ toast('Fout: '+e.message,'error'); }
-  hideLoading();
-}
-
-function sv(id){const v=document.getElementById(id).value;return v===''?null:parseInt(v);}
-
-// ── KOTC DUO ─────────────────────────────────────────────
+// ── KOTC FUNCTIES (verkort weergegeven) ────────────────────
 function initKotcForm(){kotcDuos=[];kotcDuoCount=0;document.getElementById('kotc-duos-container').innerHTML='';addKotcDuo();addKotcDuo();}
-
 function addKotcDuo(){
   const idx=kotcDuoCount++;
   kotcDuos.push({idx,p1:null,p2:null,pos:null});
@@ -787,7 +893,6 @@ function setKotcPos(duoIdx,pos){
     row.querySelectorAll('.pos-btn').forEach((btn,i)=>btn.classList.toggle('active',d.pos===i+1));
   });
 }
-
 async function submitKotc(){
   if(kotcDuos.length<2){toast('Voeg minimaal 2 duo\'s toe.','error');return;}
   for(const d of kotcDuos){
@@ -799,20 +904,14 @@ async function submitKotc(){
   if(new Set(allIds).size<allIds.length){toast('Een speler mag niet twee keer meedoen.','error');return;}
   const allLevels=allIds.map(id=>level(players.find(p=>p.id===id).rating));
   if(!allLevels.every(l=>l===allLevels[0])){toast('Alle spelers moeten hetzelfde niveau hebben.','error');return;}
-
   const kotcLv=allLevels[0], promoR=KOTC_PROMO[kotcLv];
   let promoNames=[], changedPlayers=[];
-
   kotcDuos.forEach(d=>{
-    const avgOpp=kotcDuos.filter(x=>x.idx!==d.idx)
-      .flatMap(x=>[players.find(p=>p.id===x.p1),players.find(p=>p.id===x.p2)]).filter(Boolean)
-      .reduce((s,p,_,a)=>s+p.rating/a.length,0);
     [d.p1,d.p2].forEach(pid=>{
       const p=players.find(x=>x.id===pid);
       const oldLv=level(p.rating);
       if(d.pos===1){p.rating=promoR;p.wins++;promoNames.push(p.name);if(lvOrder(level(p.rating))<lvOrder(oldLv))promos++;}
       else if(d.pos===2){
-        // Verlies: KNLTB formule tegen gemiddelde van alle andere duos
         const avgOpp = kotcDuos.filter(x=>x.idx!==d.idx)
           .flatMap(x=>[players.find(p=>p.id===x.p1),players.find(p=>p.id===x.p2)]).filter(Boolean)
           .reduce((s,op,_,a)=>s+op.rating/a.length,0);
@@ -827,11 +926,10 @@ async function submitKotc(){
       changedPlayers.push(p);
     });
   });
-
   showLoading('KotC opslaan…');
   try {
-    await dbUpdatePlayers(changedPlayers);
-    await dbInsertMatch({
+    await updatePlayersBatch(changedPlayers);
+    await sb.from('matches').insert({
       date:new Date().toISOString(),
       team_a:kotcDuos.slice(0,2).flatMap(d=>[d.p1,d.p2]),
       team_b:kotcDuos.slice(2).flatMap(d=>[d.p1,d.p2]),
@@ -839,13 +937,13 @@ async function submitKotc(){
       kotc_level:kotcLv,
       kotc_duos:JSON.stringify(kotcDuos.map(d=>({ids:[d.p1,d.p2],pos:d.pos})))
     });
-    if(promoNames.length) await dbSetSetting('promos', promos);
+    if(promoNames.length) await sb.from('settings').upsert({key:'promos', value:String(promos)});
     await loadAll();
     document.getElementById('promo-text').textContent='👑 KotC! '+promoNames.join(' & ')+' promoveren naar '+nextLevel(kotcLv)+'!';
     document.getElementById('promo-banner').classList.add('show');
     toast('King of the Court opgeslagen!','promo');
     initWedstrijd();
-  } catch(e){ toast('Fout: '+e.message,'error'); }
+  } catch(e){ toast('Fout: '+e.message,'error');}
   hideLoading();
 }
 
@@ -866,7 +964,6 @@ function renderPlayers(){
     </div>`;
   }).join('');
 }
-
 async function addPlayer(){
   const name=document.getElementById('np-name').value.trim();
   const email=document.getElementById('np-email').value.trim();
@@ -893,7 +990,7 @@ async function checkAdmin(){
     document.getElementById('admin-lock').style.display='none';
     document.getElementById('admin-panel').style.display='block';
     renderAdminTable();
-    renderRanking(); renderPlayers(); // e-mails zichtbaar maken
+    renderRanking(); renderPlayers();
   } else toast('Verkeerd wachtwoord.','error');
 }
 function lockAdmin(){
@@ -901,12 +998,12 @@ function lockAdmin(){
   document.getElementById('admin-lock').style.display='flex';
   document.getElementById('admin-panel').style.display='none';
   document.getElementById('admin-pw').value='';
-  renderRanking(); renderPlayers(); // e-mails verbergen
+  renderRanking(); renderPlayers();
 }
 async function changePassword(){
   const pw=document.getElementById('new-pw').value.trim();
   if(!pw){toast('Voer een wachtwoord in.','error');return;}
-  await dbSetSetting('admin_pw',pw);
+  await sb.from('settings').upsert({key:'admin_pw',value:pw});
   adminPw=pw;document.getElementById('new-pw').value='';
   toast('Wachtwoord opgeslagen.','success');
 }
@@ -935,13 +1032,10 @@ function renderAdminTable(){
   }).join('');
 }
 function adminPage(d){adminCur=Math.max(0,adminCur+d);renderAdminTable();}
-
 function showPlayerHistory(id){
   const p=players.find(x=>x.id===id); if(!p)return;
   const n=pid=>(players.find(x=>x.id===pid)||{}).name||('Speler '+pid);
-  const playerMatches=matches.filter(m=>
-    (m.team_a||[]).includes(id)||(m.team_b||[]).includes(id)
-  );
+  const playerMatches=matches.filter(m=>(m.team_a||[]).includes(id)||(m.team_b||[]).includes(id));
   document.getElementById('history-modal-title').textContent=`${p.name} — ${playerMatches.length} wedstrijden`;
   if(!playerMatches.length){
     document.getElementById('history-modal-list').innerHTML='<p style="color:var(--text2);font-size:13px;padding:1rem 0">Nog geen wedstrijden gespeeld.</p>';
@@ -970,7 +1064,6 @@ function showPlayerHistory(id){
   }).join('');
   openModal('modal-history');
 }
-
 function editPlayer(id){
   const p=players.find(x=>x.id===id); if(!p)return;
   document.getElementById('edit-id').value=id;
@@ -992,7 +1085,7 @@ async function saveEdit(){
   p.rating=rating; p.matches=parseInt(document.getElementById('edit-matches').value)||0;
   p.wins=parseInt(document.getElementById('edit-wins').value)||0;
   showLoading('Opslaan…');
-  try { await dbUpsertPlayer(p); renderAdminTable();renderPlayers();renderRanking();closeModal('modal-edit');toast(name+' opgeslagen.','success'); }
+  try { await updatePlayersBatch([p]); renderAdminTable();renderPlayers();renderRanking();closeModal('modal-edit');toast(name+' opgeslagen.','success'); }
   catch(e){toast('Fout: '+e.message,'error');}
   hideLoading();
 }
@@ -1028,10 +1121,8 @@ async function parseCSV(text){
     const displayName=name||(email.split('@')[0].replace(/[._]/g,' ').replace(/\b\w/g,c=>c.toUpperCase()));
     const exists=players.find(p=>p.email&&email&&p.email.toLowerCase()===email.toLowerCase());
     if(exists){
-      // Update bestaande speler via id
       toUpdate.push({id:exists.id, name:displayName||exists.name, email, rating, matches:matc, wins});
     } else {
-      // Nieuwe speler — GEEN id meesturen, Supabase genereert het
       toInsert.push({name:displayName, email, rating, matches:matc, wins});
     }
   }
@@ -1041,7 +1132,6 @@ async function parseCSV(text){
       const {error}=await sb.from('players').upsert(toUpdate, {onConflict:'id'});
       if(error) throw error;
     }
-    // Batchgewijs invoegen (max 500 per keer voor grote CSV's)
     for(let i=0;i<toInsert.length;i+=500){
       const batch=toInsert.slice(i,i+500);
       const {error}=await sb.from('players').insert(batch);
@@ -1052,7 +1142,6 @@ async function parseCSV(text){
   } catch(e){toast('Import fout: '+e.message,'error');}
   hideLoading();
 }
-
 function exportCSV(){
   const rows=[['naam','email','rating','wedstrijden','gewonnen','niveau']];
   [...players].sort((a,b)=>a.rating-b.rating).forEach(p=>rows.push([p.name,p.email||'',p.rating.toFixed(2),p.matches,p.wins,level(p.rating)]));
@@ -1069,13 +1158,12 @@ function dl(rows,fn){
   const a=document.createElement('a');a.href='data:text/csv;charset=utf-8,\uFEFF'+encodeURIComponent(csv);a.download=fn;a.click();
 }
 function today(){return new Date().toISOString().slice(0,10);}
-
 async function resetAll(){
   showLoading('Verwijderen…');
   try {
     await sb.from('matches').delete().neq('id',0);
     await sb.from('players').delete().neq('id',0);
-    await dbSetSetting('promos','0');
+    await sb.from('settings').upsert({key:'promos',value:'0'});
     players=[];matches=[];promos=0;
     renderRanking();renderPlayers();renderHistory();
     closeModal('modal-reset');toast('Alle data verwijderd.','info');
@@ -1110,13 +1198,16 @@ function renderHistory(){
 
 // ── DRAG & DROP ───────────────────────────────────────────
 const dz=document.getElementById('drop-zone');
-dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('dragover');});
-dz.addEventListener('dragleave',()=>dz.classList.remove('dragover'));
-dz.addEventListener('drop',e=>{e.preventDefault();dz.classList.remove('dragover');const f=e.dataTransfer.files[0];if(f?.name.endsWith('.csv')){const r=new FileReader();r.onload=ev=>parseCSV(ev.target.result);r.readAsText(f,'utf-8');}});
+if(dz){
+  dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('dragover');});
+  dz.addEventListener('dragleave',()=>dz.classList.remove('dragover'));
+  dz.addEventListener('drop',e=>{e.preventDefault();dz.classList.remove('dragover');const f=e.dataTransfer.files[0];if(f?.name.endsWith('.csv')){const r=new FileReader();r.onload=ev=>parseCSV(ev.target.result);r.readAsText(f,'utf-8');}});
+}
 document.querySelectorAll('.modal-overlay').forEach(el=>el.addEventListener('click',e=>{if(e.target===el)el.classList.remove('open');}));
 
 // ── START ────────────────────────────────────────────────
 loadAll();
+testConnection();
 </script>
 </body>
 </html>
