@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="nl">
 <head>
@@ -558,35 +559,35 @@ async function loadAll(){
   hideLoading();
 }
 
-async function updatePlayersBatch(playersToUpdate) {
-    if (!playersToUpdate || playersToUpdate.length === 0) return;
+// ✅ FIXED: Speler updaten zonder ID in de data (want ID is GENERATED ALWAYS)
+async function updateSinglePlayer(player) {
+    // Stuur GEEN id mee in de data - alleen de velden die we willen updaten
+    const playerData = {
+        name: player.name,
+        email: player.email || '',
+        rating: Math.round(player.rating * 100) / 100,
+        matches: player.matches,
+        wins: player.wins
+    };
     
-    const formattedPlayers = playersToUpdate.map(p => ({
-        id: p.id,
-        name: p.name,
-        email: p.email || '',
-        rating: Math.round(p.rating * 100) / 100,
-        matches: p.matches,
-        wins: p.wins
-    }));
+    console.log(`📤 Updating player: ${player.name} (ID: ${player.id}) -> nieuwe rating: ${playerData.rating}`);
     
-    console.log('📤 Updating players:', formattedPlayers.map(p => ({ id: p.id, name: p.name, rating: p.rating })));
-    
+    // Gebruik update() met een WHERE clause om de juiste rij te vinden
     const { data, error } = await sb
         .from('players')
-        .upsert(formattedPlayers, { onConflict: 'id' })
+        .update(playerData)
+        .eq('id', player.id)
         .select();
     
     if (error) {
-        console.error('❌ Player update failed:', error);
+        console.error(`❌ Failed to update player ${player.id}:`, error);
         throw error;
     }
-    
-    console.log('✅ Players updated successfully:', data?.length || 0, 'players');
+    console.log(`✅ Player ${player.name} updated successfully`);
     return data;
 }
 
-// ── SUBMIT MATCH (VERBETERD) ─────────────────────────────────
+// ── SUBMIT MATCH (FULLY FIXED) ────────────────────────────
 async function submitMatch() {
     console.log('🎾 submitMatch() started');
     
@@ -690,9 +691,14 @@ async function submitMatch() {
         if (matchError) throw new Error(`Match insert failed: ${matchError.message}`);
         console.log('✅ Match saved successfully');
         
-        // 6. Update spelers in database (BATCH)
+        // 6. Update spelers één voor één in database (zonder ID in de data)
         const playersToUpdate = [...pA, ...pB];
-        await updatePlayersBatch(playersToUpdate);
+        console.log(`💾 Updating ${playersToUpdate.length} players one by one...`);
+        
+        for (const player of playersToUpdate) {
+            await updateSinglePlayer(player);
+        }
+        console.log('✅ All players updated successfully');
         
         // 7. Update promos setting
         if (comp && promoNames.length) {
@@ -730,8 +736,84 @@ async function submitMatch() {
 
 function sv(id){const v=document.getElementById(id).value;return v===''?null:parseInt(v);}
 
-// ── REST VAN DE FUNCTIES (ongewijzigd) ────────────────────
-// ... (de rest van je functies blijven hetzelfde)
+// ── REST VAN DE FUNCTIES (KotC ook gefixt) ─────────────────
+async function submitKotc(){
+  if(kotcDuos.length<2){toast('Voeg minimaal 2 duo\'s toe.','error');return;}
+  for(const d of kotcDuos){
+    if(!d.p1||!d.p2){toast('Selecteer alle spelers.','error');return;}
+    if(!d.pos){toast('Geef elk duo een eindpositie.','error');return;}
+  }
+  if(new Set(kotcDuos.map(d=>d.pos)).size<kotcDuos.length){toast('Elke positie maar één keer.','error');return;}
+  const allIds=kotcDuos.flatMap(d=>[d.p1,d.p2]);
+  if(new Set(allIds).size<allIds.length){toast('Een speler mag niet twee keer meedoen.','error');return;}
+  const allLevels=allIds.map(id=>level(players.find(p=>p.id===id).rating));
+  if(!allLevels.every(l=>l===allLevels[0])){toast('Alle spelers moeten hetzelfde niveau hebben.','error');return;}
+  const kotcLv=allLevels[0], promoR=KOTC_PROMO[kotcLv];
+  let promoNames=[], changedPlayers=[];
+  
+  // Haal frisse spelers op uit database
+  const { data: freshPlayers, error: fetchError } = await sb
+      .from('players')
+      .select('*')
+      .in('id', allIds);
+  if (fetchError) throw fetchError;
+  
+  const playerMap = new Map();
+  freshPlayers.forEach(p => playerMap.set(p.id, p));
+  
+  kotcDuos.forEach(d=>{
+    const p1 = playerMap.get(d.p1);
+    const p2 = playerMap.get(d.p2);
+    const oldLv1 = level(p1.rating);
+    const oldLv2 = level(p2.rating);
+    
+    if(d.pos===1){
+      p1.rating = promoR;
+      p2.rating = promoR;
+      p1.wins++;
+      p2.wins++;
+      promoNames.push(p1.name, p2.name);
+      if(lvOrder(level(p1.rating)) < lvOrder(oldLv1)) promos++;
+      if(lvOrder(level(p2.rating)) < lvOrder(oldLv2)) promos++;
+    }
+    else if(d.pos===2){
+      const avgOpp = kotcDuos.filter(x=>x.idx!==d.idx)
+        .flatMap(x=>[playerMap.get(x.p1), playerMap.get(x.p2)]).filter(Boolean)
+        .reduce((s,op,_,a)=>s+op.rating/a.length,0);
+      const r12own = combinedRating(p1.rating, p2.rating);
+      const probLose = winProb(r12own, avgOpp);
+      p1.rating = Math.max(1.0, Math.min(9.0, Math.min(p1.rating - 0.1, newRating(p1.rating, probLose, 0))));
+      p2.rating = Math.max(1.0, Math.min(9.0, Math.min(p2.rating - 0.1, newRating(p2.rating, probLose, 0))));
+    }
+    p1.matches++;
+    p2.matches++;
+    changedPlayers.push(p1, p2);
+  });
+  
+  showLoading('KotC opslaan…');
+  try {
+    // Update spelers één voor één
+    for (const player of changedPlayers) {
+      await updateSinglePlayer(player);
+    }
+    
+    await sb.from('matches').insert({
+      date:new Date().toISOString(),
+      team_a:kotcDuos.slice(0,2).flatMap(d=>[d.p1,d.p2]),
+      team_b:kotcDuos.slice(2).flatMap(d=>[d.p1,d.p2]),
+      score_a:[], score_b:[], competitive:true, kotc:true,
+      kotc_level:kotcLv,
+      kotc_duos:JSON.stringify(kotcDuos.map(d=>({ids:[d.p1,d.p2],pos:d.pos})))
+    });
+    if(promoNames.length) await sb.from('settings').upsert({key:'promos', value:String(promos)});
+    await loadAll();
+    document.getElementById('promo-text').textContent='👑 KotC! '+promoNames.join(' & ')+' promoveren naar '+nextLevel(kotcLv)+'!';
+    document.getElementById('promo-banner').classList.add('show');
+    toast('King of the Court opgeslagen!','promo');
+    initWedstrijd();
+  } catch(e){ toast('Fout: '+e.message,'error');}
+  hideLoading();
+}
 
 // ── NAVIGATIE ─────────────────────────────────────────────
 function nav(page,btn){
@@ -832,7 +914,7 @@ function setMode(mode,btn){
   if(mode==='kotc')initKotcForm();
 }
 
-// ── KOTC FUNCTIES (verkort weergegeven) ────────────────────
+// ── KOTC FUNCTIES ─────────────────────────────────────────
 function initKotcForm(){kotcDuos=[];kotcDuoCount=0;document.getElementById('kotc-duos-container').innerHTML='';addKotcDuo();addKotcDuo();}
 function addKotcDuo(){
   const idx=kotcDuoCount++;
@@ -892,59 +974,6 @@ function setKotcPos(duoIdx,pos){
     const row=document.getElementById('kpos-'+d.idx); if(!row)return;
     row.querySelectorAll('.pos-btn').forEach((btn,i)=>btn.classList.toggle('active',d.pos===i+1));
   });
-}
-async function submitKotc(){
-  if(kotcDuos.length<2){toast('Voeg minimaal 2 duo\'s toe.','error');return;}
-  for(const d of kotcDuos){
-    if(!d.p1||!d.p2){toast('Selecteer alle spelers.','error');return;}
-    if(!d.pos){toast('Geef elk duo een eindpositie.','error');return;}
-  }
-  if(new Set(kotcDuos.map(d=>d.pos)).size<kotcDuos.length){toast('Elke positie maar één keer.','error');return;}
-  const allIds=kotcDuos.flatMap(d=>[d.p1,d.p2]);
-  if(new Set(allIds).size<allIds.length){toast('Een speler mag niet twee keer meedoen.','error');return;}
-  const allLevels=allIds.map(id=>level(players.find(p=>p.id===id).rating));
-  if(!allLevels.every(l=>l===allLevels[0])){toast('Alle spelers moeten hetzelfde niveau hebben.','error');return;}
-  const kotcLv=allLevels[0], promoR=KOTC_PROMO[kotcLv];
-  let promoNames=[], changedPlayers=[];
-  kotcDuos.forEach(d=>{
-    [d.p1,d.p2].forEach(pid=>{
-      const p=players.find(x=>x.id===pid);
-      const oldLv=level(p.rating);
-      if(d.pos===1){p.rating=promoR;p.wins++;promoNames.push(p.name);if(lvOrder(level(p.rating))<lvOrder(oldLv))promos++;}
-      else if(d.pos===2){
-        const avgOpp = kotcDuos.filter(x=>x.idx!==d.idx)
-          .flatMap(x=>[players.find(p=>p.id===x.p1),players.find(p=>p.id===x.p2)]).filter(Boolean)
-          .reduce((s,op,_,a)=>s+op.rating/a.length,0);
-        const r12own = combinedRating(
-          players.find(x=>x.id===d.p1).rating,
-          players.find(x=>x.id===d.p2).rating
-        );
-        const probLose = winProb(r12own, avgOpp);
-        p.rating = Math.max(1.0, Math.min(9.0, Math.min(p.rating - 0.1, newRating(p.rating, probLose, 0))));
-      }
-      p.matches++;
-      changedPlayers.push(p);
-    });
-  });
-  showLoading('KotC opslaan…');
-  try {
-    await updatePlayersBatch(changedPlayers);
-    await sb.from('matches').insert({
-      date:new Date().toISOString(),
-      team_a:kotcDuos.slice(0,2).flatMap(d=>[d.p1,d.p2]),
-      team_b:kotcDuos.slice(2).flatMap(d=>[d.p1,d.p2]),
-      score_a:[], score_b:[], competitive:true, kotc:true,
-      kotc_level:kotcLv,
-      kotc_duos:JSON.stringify(kotcDuos.map(d=>({ids:[d.p1,d.p2],pos:d.pos})))
-    });
-    if(promoNames.length) await sb.from('settings').upsert({key:'promos', value:String(promos)});
-    await loadAll();
-    document.getElementById('promo-text').textContent='👑 KotC! '+promoNames.join(' & ')+' promoveren naar '+nextLevel(kotcLv)+'!';
-    document.getElementById('promo-banner').classList.add('show');
-    toast('King of the Court opgeslagen!','promo');
-    initWedstrijd();
-  } catch(e){ toast('Fout: '+e.message,'error');}
-  hideLoading();
 }
 
 // ── SPELERS ───────────────────────────────────────────────
@@ -1085,7 +1114,10 @@ async function saveEdit(){
   p.rating=rating; p.matches=parseInt(document.getElementById('edit-matches').value)||0;
   p.wins=parseInt(document.getElementById('edit-wins').value)||0;
   showLoading('Opslaan…');
-  try { await updatePlayersBatch([p]); renderAdminTable();renderPlayers();renderRanking();closeModal('modal-edit');toast(name+' opgeslagen.','success'); }
+  try { 
+    await updateSinglePlayer(p);
+    renderAdminTable();renderPlayers();renderRanking();closeModal('modal-edit');toast(name+' opgeslagen.','success'); 
+  }
   catch(e){toast('Fout: '+e.message,'error');}
   hideLoading();
 }
@@ -1129,8 +1161,9 @@ async function parseCSV(text){
   showLoading(`${toInsert.length+toUpdate.length} spelers verwerken…`);
   try {
     if(toUpdate.length){
-      const {error}=await sb.from('players').upsert(toUpdate, {onConflict:'id'});
-      if(error) throw error;
+      for(const player of toUpdate) {
+        await updateSinglePlayer(player);
+      }
     }
     for(let i=0;i<toInsert.length;i+=500){
       const batch=toInsert.slice(i,i+500);
